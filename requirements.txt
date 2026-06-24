@@ -6,4 +6,3 @@ pandas
 openpyxl
 pyzbar
 Pillow
-requests

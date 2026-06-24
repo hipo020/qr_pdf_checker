@@ -1,10 +1,13 @@
+import html
 import io
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.request import Request, urlopen
 
 import cv2
 import fitz  # PyMuPDF
@@ -17,31 +20,12 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 try:
-    import requests
-except Exception:
-    requests = None
-
-try:
     from pyzbar.pyzbar import decode as pyzbar_decode
 except Exception:
     pyzbar_decode = None
 
 
 REQUIRED_COLUMNS = ["페이지", "카드번호", "제목", "유튜브링크"]
-ISSUE_ORDER = [
-    "TITLE_MISMATCH",
-    "TITLE_CHECK",
-    "YOUTUBE_TITLE_MISMATCH",
-    "YOUTUBE_TITLE_CHECK",
-    "YOUTUBE_TITLE_FETCH_FAIL",
-    "MISSING_QR",
-    "QR_MISMATCH",
-    "QR_URL_DETAIL_DIFF",
-    "MISSING_LINK",
-    "LINK_MISMATCH",
-    "LINK_URL_DETAIL_DIFF",
-    "QR_LINK_MISMATCH",
-]
 
 
 @dataclass
@@ -66,8 +50,11 @@ class PdfQr:
     url: str
 
 
+# -----------------------------
+# Basic parsing / comparison
+# -----------------------------
 def read_csv_flexible(file_bytes: bytes) -> pd.DataFrame:
-    """CSV 인코딩이 UTF-8, UTF-8 BOM, CP949, EUC-KR이어도 읽을 수 있게 처리합니다."""
+    """CSV 인코딩이 UTF-8, UTF-8 BOM, CP949여도 읽을 수 있게 처리."""
     last_error = None
     for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr"]:
         try:
@@ -80,10 +67,49 @@ def read_csv_flexible(file_bytes: bytes) -> pd.DataFrame:
 def normalize_text(value: str) -> str:
     value = "" if value is None else str(value)
     value = unicodedata.normalize("NFKC", value)
-    value = value.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
-    value = value.replace("–", "-").replace("—", "-")
+    value = value.replace("’", "'").replace("–", "-").replace("—", "-")
     value = re.sub(r"\s+", "", value)
     return value.lower().strip()
+
+
+def normalize_title_for_similarity(value: str) -> str:
+    value = "" if value is None else str(value)
+    value = html.unescape(value)
+    value = unicodedata.normalize("NFKC", value)
+    value = value.lower()
+    # YouTube title often includes channel/series labels. They should not dominate similarity.
+    noise_patterns = [
+        r"\bkia\s+global\s+how\s*to\b",
+        r"\bkia\s+how\s*to\b",
+        r"\bhow\s*to\b",
+        r"\bofficial\b",
+        r"\bvideo\b",
+        r"\bguide\b",
+        r"\bthe\s+kia\s+k4\b",
+    ]
+    for pat in noise_patterns:
+        value = re.sub(pat, " ", value, flags=re.IGNORECASE)
+    value = value.replace("&amp;", "&")
+    value = re.sub(r"[^a-z0-9가-힣]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def title_similarity(a: str, b: str) -> float:
+    a_norm = normalize_title_for_similarity(a)
+    b_norm = normalize_title_for_similarity(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm == b_norm:
+        return 1.0
+    seq = SequenceMatcher(None, a_norm, b_norm).ratio()
+    a_tokens = set(a_norm.split())
+    b_tokens = set(b_norm.split())
+    token_score = len(a_tokens & b_tokens) / max(len(a_tokens | b_tokens), 1)
+    contain_score = 0.0
+    if a_norm in b_norm or b_norm in a_norm:
+        contain_score = min(len(a_norm), len(b_norm)) / max(len(a_norm), len(b_norm))
+    return round(max(seq, token_score, contain_score), 3)
 
 
 def normalize_url(value: str) -> str:
@@ -93,7 +119,7 @@ def normalize_url(value: str) -> str:
 
 
 def parse_url_parts(url: str) -> Dict[str, Optional[str]]:
-    """YouTube URL은 영상 ID / playlist ID / 채널 핸들을 분리해서 비교합니다."""
+    """YouTube URL은 영상 ID / playlist ID / 채널 핸들을 분리해서 비교."""
     url = normalize_url(url)
     out = {
         "raw": url,
@@ -138,33 +164,46 @@ def parse_url_parts(url: str) -> Dict[str, Optional[str]]:
     return out
 
 
-def compare_urls(expected: str, actual: str) -> Tuple[str, str, bool]:
-    """return: 비교상태, 비고, URL 세부값 차이 여부"""
+def canonical_youtube_url(url: str) -> str:
+    parts = parse_url_parts(url)
+    if parts.get("video_id"):
+        return f"https://www.youtube.com/watch?v={parts['video_id']}"
+    return normalize_url(url)
+
+
+def compare_urls(expected: str, actual: str) -> Tuple[str, str]:
     if not actual:
-        return "MISSING", "URL 없음", False
+        return "MISSING", "URL 없음"
 
     e = parse_url_parts(expected)
     a = parse_url_parts(actual)
 
     if normalize_url(expected) == normalize_url(actual):
-        return "EXACT", "URL 전체 일치", False
+        return "EXACT", "URL 전체 일치"
 
     if e["video_id"] and a["video_id"] and e["video_id"] == a["video_id"]:
-        details = []
-        if e.get("playlist_id") != a.get("playlist_id"):
-            details.append(f"playlist/list 다름: CSV {e.get('playlist_id')} vs PDF {a.get('playlist_id')}")
+        note = "영상 ID 일치"
         if e.get("index") != a.get("index"):
-            details.append(f"index 다름: CSV {e.get('index')} vs PDF {a.get('index')}")
-        note = "영상 ID 일치" + (" / " + " / ".join(details) if details else " / URL 세부값 다름")
-        return "VIDEO_ID_MATCH", note, True
+            note += f" / index 다름: CSV {e.get('index')} vs PDF {a.get('index')}"
+        return "VIDEO_ID_MATCH", note
 
     if e["playlist_id"] and a["playlist_id"] and e["playlist_id"] == a["playlist_id"]:
-        return "PLAYLIST_MATCH", "플레이리스트 ID 일치 / URL 세부값 다름", True
+        return "PLAYLIST_MATCH", "플레이리스트 ID 일치"
 
     if e["channel"] and a["channel"] and normalize_text(e["channel"]) == normalize_text(a["channel"]):
-        return "CHANNEL_MATCH", "채널 일치 / URL 세부값 다름", True
+        return "CHANNEL_MATCH", "채널 일치"
 
-    return "MISMATCH", "기대 URL과 다름", False
+    return "MISMATCH", "기대 URL과 다름"
+
+
+def compare_two_actual_urls(url_a: str, url_b: str) -> Tuple[str, str]:
+    if not url_a and not url_b:
+        return "MISSING", "QR과 하이퍼링크가 모두 없음"
+    if not url_a:
+        return "MISSING_QR", "QR URL 없음"
+    if not url_b:
+        return "MISSING_LINK", "하이퍼링크 URL 없음"
+    return compare_urls(url_a, url_b)
 
 
 def is_external_video_url(url: str) -> bool:
@@ -174,109 +213,58 @@ def is_external_video_url(url: str) -> bool:
     return parts["type"] in {"video", "playlist", "channel"}
 
 
-def clean_youtube_title(value: str) -> str:
-    """유튜브 실제 제목 비교용으로 흔한 접두/구분자를 정리합니다."""
-    value = "" if value is None else str(value)
-    value = unicodedata.normalize("NFKC", value)
-    value = re.sub(r"\s+", " ", value).strip()
-    # 유튜브 제목에 자주 붙는 브랜드/시리즈 접두어를 비교에서 덜 민감하게 처리합니다.
-    patterns = [
-        r"^kia\s+global\s+how\s*to\s*[|:\-–—]\s*",
-        r"^kia\s+how\s*to\s*[|:\-–—]\s*",
-        r"^the\s+kia\s+k4\s*[|:\-–—]\s*",
-    ]
-    for pat in patterns:
-        value = re.sub(pat, "", value, flags=re.I)
-    return value.strip()
-
-
-def youtube_title_similarity(expected: str, actual: str) -> float:
-    """CSV/PDF 제목과 유튜브 실제 제목은 접두어가 붙을 수 있어 별도 기준으로 비교합니다."""
-    expected_clean = clean_youtube_title(expected)
-    actual_clean = clean_youtube_title(actual)
-    ne = normalize_text(expected_clean)
-    na = normalize_text(actual_clean)
-    if not ne or not na:
-        return 0.0
-    if len(ne) >= 8 and ne in na:
-        return 0.97
-    if len(na) >= 8 and na in ne:
-        return 0.92
-
-    seq = SequenceMatcher(None, ne, na).ratio()
-
-    def tokens(text: str) -> set:
-        text = unicodedata.normalize("NFKC", str(text).lower())
-        return {t for t in re.findall(r"[a-z0-9]+", text) if len(t) >= 2}
-
-    te = tokens(expected_clean)
-    ta = tokens(actual_clean)
-    if te and ta:
-        overlap = len(te & ta) / max(len(te), 1)
-        jaccard = len(te & ta) / max(len(te | ta), 1)
-        return max(seq, overlap * 0.95, jaccard)
-    return seq
-
-
-def canonical_youtube_title_url(url: str) -> str:
-    """oEmbed가 이해하기 쉬운 YouTube URL 형태로 정리합니다."""
-    parts = parse_url_parts(url)
-    if parts.get("video_id"):
-        return f"https://www.youtube.com/watch?v={parts['video_id']}"
-    if parts.get("playlist_id"):
-        return f"https://www.youtube.com/playlist?list={parts['playlist_id']}"
-    return normalize_url(url)
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+# -----------------------------
+# YouTube oEmbed title lookup
+# -----------------------------
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_youtube_title_cached(url: str) -> Tuple[str, str]:
-    """YouTube oEmbed로 실제 영상 제목을 가져옵니다. 실패 시 빈 제목과 사유를 반환합니다."""
-    if requests is None:
-        return "", "requests 라이브러리 없음"
-    target = canonical_youtube_title_url(url)
+    """Return (title, error). Uses YouTube oEmbed, no API key required."""
+    target = canonical_youtube_url(url)
     if not target:
         return "", "URL 없음"
     parts = parse_url_parts(target)
-    if parts.get("type") != "video":
-        return "", "영상 URL이 아니어서 제목 조회 생략"
+    if parts.get("type") != "video" or not parts.get("video_id"):
+        return "", "영상 URL이 아니라 실제 제목 조회를 생략함"
+
+    api = f"https://www.youtube.com/oembed?url={quote(target, safe=':/?=&')}&format=json"
     try:
-        endpoint = "https://www.youtube.com/oembed"
-        params = {"url": target, "format": "json"}
-        resp = requests.get(endpoint, params=params, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return "", f"YouTube 제목 조회 실패: HTTP {resp.status_code}"
-        data = resp.json()
-        title = str(data.get("title", "")).strip()
-        if not title:
-            return "", "YouTube 제목 없음"
+        req = Request(api, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r'"title"\s*:\s*"(.*?)"', raw)
+        if not m:
+            return "", "YouTube 제목 응답을 해석하지 못함"
+        # crude but enough for JSON string title; avoid adding dependency
+        title = bytes(m.group(1), "utf-8").decode("unicode_escape")
+        title = html.unescape(title).strip()
         return title, ""
     except Exception as exc:
-        return "", f"YouTube 제목 조회 오류: {exc}"
+        return "", f"YouTube 제목 조회 실패: {exc}"
 
 
-def choose_title_lookup_url(expected_url: str, qr_url: str, link_url: str) -> str:
-    """실제 제목 조회에 사용할 URL을 고릅니다. 하이퍼링크를 우선하되 없으면 QR, CSV 순으로 사용합니다."""
-    for value in [link_url, qr_url, expected_url]:
-        if parse_url_parts(value).get("video_id"):
-            return value
-    return ""
-
-
-def youtube_title_status(expected_title: str, pdf_title: str, youtube_title: str, fetch_note: str, ok_threshold: float, check_threshold: float) -> Tuple[str, float, float, str]:
+def judge_youtube_title(
+    youtube_title: str,
+    csv_title: str,
+    pdf_title: str,
+    ok_threshold: float,
+    check_threshold: float,
+) -> Tuple[str, float, float, str]:
     if not youtube_title:
-        if fetch_note and "생략" in fetch_note:
-            return "SKIPPED", 0.0, 0.0, fetch_note
-        return "FETCH_FAIL", 0.0, 0.0, fetch_note or "유튜브 실제 제목을 가져오지 못함"
-    csv_score = youtube_title_similarity(expected_title, youtube_title)
-    pdf_score = youtube_title_similarity(pdf_title, youtube_title) if pdf_title else 0.0
-    best_score = max(csv_score, pdf_score)
-    if csv_score >= ok_threshold or best_score >= ok_threshold:
-        return "OK", csv_score, pdf_score, "유튜브 실제 제목 유사"
-    if csv_score >= check_threshold or best_score >= check_threshold:
-        return "CHECK", csv_score, pdf_score, "유튜브 실제 제목 확인 권장"
-    return "MISMATCH", csv_score, pdf_score, "유튜브 실제 제목과 CSV/PDF 제목 차이 큼"
+        return "SKIP", 0.0, 0.0, "유튜브 제목 없음"
+    csv_score = title_similarity(youtube_title, csv_title)
+    pdf_score = title_similarity(youtube_title, pdf_title) if pdf_title else 0.0
+    best = max(csv_score, pdf_score)
+    note = f"CSV 유사도 {csv_score:.2f} / PDF 유사도 {pdf_score:.2f}"
+    if best >= ok_threshold:
+        return "OK", csv_score, pdf_score, note
+    if best >= check_threshold:
+        return "CHECK", csv_score, pdf_score, note
+    return "MISMATCH", csv_score, pdf_score, note
 
 
+# -----------------------------
+# PDF extraction
+# -----------------------------
 def load_pdf(pdf_bytes: bytes) -> fitz.Document:
     return fitz.open(stream=pdf_bytes, filetype="pdf")
 
@@ -335,8 +323,6 @@ def extract_qrs(doc: fitz.Document, zoom: float = 2.0, expected_counts: Optional
         ok, decoded_info, points, _ = detector.detectAndDecodeMulti(bgr)
         if ok and points is not None:
             for data, pts in zip(decoded_info, points):
-                if not data:
-                    continue
                 xs = pts[:, 0] / zoom
                 ys = pts[:, 1] / zoom
                 add_qr(page_index, data, xs, ys)
@@ -362,98 +348,68 @@ def extract_qrs(doc: fitz.Document, zoom: float = 2.0, expected_counts: Optional
     return qrs
 
 
-def page_text_lines(page: fitz.Page) -> List[Dict]:
-    lines = []
+def page_text_spans(page: fitz.Page) -> List[Dict]:
+    spans = []
     data = page.get_text("dict")
     for block in data.get("blocks", []):
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
-            spans = [span for span in line.get("spans", []) if span.get("text", "").strip()]
-            if not spans:
+            line_text = " ".join(span.get("text", "").strip() for span in line.get("spans", []) if span.get("text", "").strip())
+            if not line_text:
                 continue
-            text = " ".join(span.get("text", "").strip() for span in spans).strip()
-            x0 = min(span.get("bbox")[0] for span in spans)
-            y0 = min(span.get("bbox")[1] for span in spans)
-            x1 = max(span.get("bbox")[2] for span in spans)
-            y1 = max(span.get("bbox")[3] for span in spans)
-            lines.append({"text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
-    lines.sort(key=lambda s: (round(s["y0"] / 4) * 4, s["x0"]))
-    return lines
+            xs0, ys0, xs1, ys1 = [], [], [], []
+            for span in line.get("spans", []):
+                text = span.get("text", "").strip()
+                if not text:
+                    continue
+                x0, y0, x1, y1 = span.get("bbox")
+                xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
+            if xs0:
+                spans.append({"text": line_text, "x0": min(xs0), "y0": min(ys0), "x1": max(xs1), "y1": max(ys1)})
+    return spans
+
+
+def extract_title_text_for_region(page: fitz.Page, x0: float, x1: float, y_min: float, y_max: float) -> str:
+    spans = page_text_spans(page)
+    selected = []
+    for sp in spans:
+        cx = (sp["x0"] + sp["x1"]) / 2
+        cy = (sp["y0"] + sp["y1"]) / 2
+        if x0 <= cx <= x1 and y_min <= cy <= y_max:
+            selected.append(sp)
+    selected.sort(key=lambda s: (round(s["y0"] / 4) * 4, s["x0"]))
+    return " ".join(s["text"] for s in selected).strip()
+
+
+def find_best_title_in_card(page: fitz.Page, expected_title: str, x0: float, x1: float, y_min: float, y_max: float) -> Tuple[str, float]:
+    spans = page_text_spans(page)
+    candidates = []
+    # Wider search inside the card, but still avoids footer/nav areas.
+    for sp in spans:
+        cx = (sp["x0"] + sp["x1"]) / 2
+        cy = (sp["y0"] + sp["y1"]) / 2
+        if x0 <= cx <= x1 and 100 <= cy <= min(page.rect.height - 80, 680):
+            text = sp["text"].strip()
+            if not text:
+                continue
+            # Skip repeated helper/footer text.
+            skip_tokens = ["click to play", "scan the qr", "youtube video", "kia how to package", "introduction category"]
+            if any(tok in text.lower() for tok in skip_tokens):
+                continue
+            score = title_similarity(text, expected_title)
+            if score > 0:
+                candidates.append((score, text, sp["y0"]))
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[2]))
+        return candidates[0][1], candidates[0][0]
+    fallback = extract_title_text_for_region(page, x0, x1, y_min, y_max)
+    return fallback, title_similarity(fallback, expected_title)
 
 
 def page_has_text(page: fitz.Page, expected_title: str) -> bool:
     text = page.get_text("text") or ""
     return normalize_text(expected_title) in normalize_text(text)
-
-
-def similarity(a: str, b: str) -> float:
-    na, nb = normalize_text(a), normalize_text(b)
-    if not na or not nb:
-        return 0.0
-    base = SequenceMatcher(None, na, nb).ratio()
-    if na in nb or nb in na:
-        # 짧은 일부 단어만 잡혔는데 100% 일치로 처리되는 것을 방지합니다.
-        coverage = min(len(na), len(nb)) / max(len(na), len(nb))
-        return max(base, coverage)
-    return base
-
-
-def best_title_in_region(
-    page: fitz.Page,
-    expected_title: str,
-    x0: float,
-    x1: float,
-    y_min: float,
-    y_max: float,
-    auto_expand: bool = True,
-) -> Tuple[str, float, str]:
-    """카드 영역 안에서 CSV 제목과 가장 유사한 텍스트를 찾습니다."""
-    all_lines = page_text_lines(page)
-
-    def pick_lines(local_y_min: float, local_y_max: float) -> List[Dict]:
-        selected = []
-        for line in all_lines:
-            cx = (line["x0"] + line["x1"]) / 2
-            cy = (line["y0"] + line["y1"]) / 2
-            if x0 <= cx <= x1 and local_y_min <= cy <= local_y_max:
-                selected.append(line)
-        selected.sort(key=lambda s: (round(s["y0"] / 4) * 4, s["x0"]))
-        return selected
-
-    def score_candidates(lines: List[Dict]) -> Tuple[str, float]:
-        best_text = ""
-        best_score = 0.0
-        # 제목이 1~3줄로 나뉘는 경우가 많아 인접 줄을 묶어서 비교합니다.
-        for i in range(len(lines)):
-            for n in [1, 2, 3, 4, 5]:
-                chunk = lines[i : i + n]
-                if not chunk:
-                    continue
-                # 세로 위치가 너무 떨어진 줄은 하나의 제목으로 묶지 않습니다.
-                if len(chunk) > 1 and max(c["y1"] for c in chunk) - min(c["y0"] for c in chunk) > 130:
-                    continue
-                text = " ".join(c["text"] for c in chunk).strip()
-                score = similarity(expected_title, text)
-                if score > best_score:
-                    best_text, best_score = text, score
-        return best_text, best_score
-
-    lines = pick_lines(y_min, y_max)
-    best_text, best_score = score_candidates(lines)
-    source = "설정 Y범위"
-
-    if auto_expand and best_score < 0.72:
-        # 레이아웃이 조금 바뀌어도 제목을 찾을 수 있게 카드 중간 영역을 넓게 재탐색합니다.
-        expanded_min = page.rect.height * 0.25
-        expanded_max = page.rect.height * 0.72
-        expanded_lines = pick_lines(expanded_min, expanded_max)
-        expanded_text, expanded_score = score_candidates(expanded_lines)
-        if expanded_score > best_score:
-            best_text, best_score = expanded_text, expanded_score
-            source = "자동 확장 탐색"
-
-    return best_text, best_score, source
 
 
 def group_by_page(items):
@@ -465,52 +421,69 @@ def group_by_page(items):
     return grouped
 
 
-def card_x_region(page: fitz.Page, card_count: int, card_no: int) -> Tuple[float, float]:
+def row_card_rect(page: fitz.Page, card_count: int, card_no: int, link: Optional[PdfLink], qr: Optional[PdfQr]) -> Tuple[float, float, float, float]:
+    if link:
+        return link.x0, link.y0, link.x1, link.y1
+    if qr:
+        width = page.rect.width
+        approx_width = width / max(card_count, 1)
+        cx = (qr.x0 + qr.x1) / 2
+        return max(0, cx - approx_width / 2), 0, min(width, cx + approx_width / 2), page.rect.height
+
     width = page.rect.width
-    # 좌우 여백이 있어도 카드 번호별 중심이 안정적으로 잡히도록 전체 폭을 카드 수로 나눕니다.
-    card_count = max(card_count, 1)
-    x0 = (card_no - 1) * width / card_count
-    x1 = card_no * width / card_count
-    return x0, x1
+    margin = width * 0.04
+    usable = width - margin * 2
+    card_w = usable / max(card_count, 1)
+    x0 = margin + (card_no - 1) * card_w
+    x1 = margin + card_no * card_w
+    return x0, 0, x1, page.rect.height
 
 
-def item_center_x(item) -> float:
-    return (item.x0 + item.x1) / 2
+# -----------------------------
+# Validation
+# -----------------------------
+def action_memo(issues: List[str], detail_notes: List[str]) -> str:
+    if not issues and not detail_notes:
+        return "수정 없음"
+    messages = []
+    if "TITLE_MISMATCH" in issues:
+        messages.append("PDF 카드 제목을 CSV 제목과 맞춰 확인하세요.")
+    if "TITLE_CHECK" in issues:
+        messages.append("제목 위치/카드 매칭이 애매합니다. 페이지 미리보기에서 카드 위치를 확인하세요.")
+    if "MISSING_QR" in issues:
+        messages.append("QR이 없거나 인식되지 않았습니다. QR 이미지 선명도와 위치를 확인하세요.")
+    if "QR_MISMATCH" in issues:
+        messages.append("QR에 들어간 URL이 CSV 기준 링크와 다릅니다.")
+    if "MISSING_LINK" in issues:
+        messages.append("카드/Click to play 영역에 하이퍼링크를 추가하세요.")
+    if "LINK_MISMATCH" in issues:
+        messages.append("카드 하이퍼링크 URL이 CSV 기준 링크와 다릅니다.")
+    if "QR_LINK_MISMATCH" in issues:
+        messages.append("QR URL과 카드 하이퍼링크 URL이 서로 다릅니다.")
+    if "YOUTUBE_TITLE_MISMATCH" in issues:
+        messages.append("연결된 유튜브 실제 제목이 CSV/PDF 제목과 크게 다릅니다. 링크가 맞는지 확인하세요.")
+    if "YOUTUBE_TITLE_CHECK" in issues:
+        messages.append("유튜브 제목은 비슷하지만 문구 차이가 있어 확인을 권장합니다.")
+    if "YOUTUBE_TITLE_FETCH_FAIL" in issues:
+        messages.append("유튜브 실제 제목을 가져오지 못했습니다. 네트워크/비공개 영상 여부를 확인하세요.")
+    if not messages and detail_notes:
+        messages.append("실제 연결 영상은 같지만 URL 세부값이 다릅니다.")
+    return " ".join(messages)
 
 
-def item_key(item) -> Tuple[int, float, float, str]:
-    url = getattr(item, "url", "") or ""
-    return (item.page, round(item.x0, 2), round(item.y0, 2), url)
-
-
-def find_item_for_card(items: List, page: fitz.Page, card_count: int, card_no: int, used_keys: set):
-    """카드번호의 x영역에 들어오는 QR/링크를 우선 매칭하고, 실패하면 기존처럼 순서 기준으로 보조 매칭합니다."""
-    if not items:
-        return None
-    x0, x1 = card_x_region(page, card_count, card_no)
-    candidates = [item for item in items if item_key(item) not in used_keys and x0 <= item_center_x(item) <= x1]
-    if candidates:
-        candidates.sort(key=lambda r: (r.x0, r.y0))
-        return candidates[0]
-
-    remaining = [item for item in items if item_key(item) not in used_keys]
-    if remaining:
-        remaining.sort(key=lambda r: (r.x0, r.y0))
-        # 보조: 카드번호 순서에 맞는 남은 항목을 선택합니다.
-        if card_no - 1 < len(items):
-            fallback = items[card_no - 1]
-            if item_key(fallback) not in used_keys:
-                return fallback
-        return remaining[0]
-    return None
-
-
-def title_status_from_score(score: float, page_match: bool, ok_threshold: float, check_threshold: float) -> str:
-    if score >= ok_threshold:
-        return "OK"
-    if score >= check_threshold or page_match:
-        return "PAGE_ONLY"
-    return "MISMATCH"
+def summarize_link_result(qr_status: str, link_status: str, qr_link_status: str) -> str:
+    if qr_status == "MISSING" and link_status == "MISSING":
+        return "QR/하이퍼링크 없음"
+    if qr_status == "MISSING":
+        return "QR 없음"
+    if link_status == "MISSING":
+        return "하이퍼링크 없음"
+    bad = {"MISMATCH", "MISSING", "MISSING_QR", "MISSING_LINK"}
+    if qr_status in bad or link_status in bad or qr_link_status in {"MISMATCH", "MISSING_QR", "MISSING_LINK"}:
+        return "불일치"
+    if qr_status != "EXACT" or link_status != "EXACT" or qr_link_status != "EXACT":
+        return "실질 일치 / 세부값 확인"
+    return "일치"
 
 
 def validate_video_cards(
@@ -521,12 +494,10 @@ def validate_video_cards(
     title_y_min: float,
     title_y_max: float,
     semantic_match_ok: bool = True,
-    auto_title_search: bool = True,
-    title_ok_threshold: float = 0.88,
-    title_check_threshold: float = 0.68,
-    youtube_title_check: bool = False,
-    youtube_title_ok_threshold: float = 0.82,
-    youtube_title_check_threshold: float = 0.62,
+    auto_title_region: bool = True,
+    check_youtube_titles: bool = False,
+    youtube_ok_threshold: float = 0.82,
+    youtube_check_threshold: float = 0.62,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = csv_df.copy()
     for col in REQUIRED_COLUMNS:
@@ -553,92 +524,35 @@ def validate_video_cards(
         expected_title = str(r["제목"]).strip()
         expected_url = str(r["유튜브링크"]).strip()
 
-        if page_num < 1 or page_num > len(doc):
-            results.append(
-                {
-                    "상태": "ISSUE",
-                    "문제유형": "PAGE_NOT_FOUND",
-                    "페이지": page_num,
-                    "카드번호": card_no,
-                    "CSV 제목": expected_title,
-                    "PDF 카드영역 텍스트": "",
-                    "제목유사도": 0,
-                    "제목검수": "MISMATCH",
-                    "유튜브 실제 제목": "",
-                    "CSV-유튜브 제목유사도": 0,
-                    "PDF-유튜브 제목유사도": 0,
-                    "유튜브제목검수": "SKIPPED",
-                    "CSV URL": expected_url,
-                    "QR URL": "",
-                    "QR검수": "MISSING",
-                    "하이퍼링크 URL": "",
-                    "하이퍼링크검수": "MISSING",
-                    "QR-하이퍼링크검수": "MISSING",
-                    "비고": "CSV의 페이지 번호가 PDF 페이지 수를 벗어남",
-                }
-            )
-            continue
-
         page = doc[page_num - 1]
         page_qrs = qrs_by_page.get(page_num, [])
         page_links = links_by_page.get(page_num, [])
-        card_count = int(card_count_by_page.get(page_num, 4))
-
-        qr = find_item_for_card(page_qrs, page, card_count, card_no, matched_qr_keys)
-        link = find_item_for_card(page_links, page, card_count, card_no, matched_link_keys)
+        qr = page_qrs[card_no - 1] if card_no - 1 < len(page_qrs) else None
+        link = page_links[card_no - 1] if card_no - 1 < len(page_links) else None
 
         if qr:
-            matched_qr_keys.add(item_key(qr))
+            matched_qr_keys.add((qr.page, round(qr.x0, 2), round(qr.y0, 2), qr.url))
         if link:
-            matched_link_keys.add(item_key(link))
+            matched_link_keys.add((link.page, round(link.x0, 2), round(link.y0, 2), link.url))
 
-        x0, x1 = card_x_region(page, card_count, card_no)
-        pdf_title_region, title_score, title_source = best_title_in_region(
-            page,
-            expected_title,
-            x0,
-            x1,
-            title_y_min,
-            title_y_max,
-            auto_expand=auto_title_search,
-        )
+        card_count = int(card_count_by_page.get(page_num, 4))
+        x0, _, x1, _ = row_card_rect(page, card_count, card_no, link, qr)
+        if auto_title_region:
+            pdf_title_region, title_score = find_best_title_in_card(page, expected_title, x0, x1, title_y_min, title_y_max)
+        else:
+            pdf_title_region = extract_title_text_for_region(page, x0, x1, title_y_min, title_y_max)
+            title_score = title_similarity(pdf_title_region, expected_title)
+
+        title_region_match = normalize_text(expected_title) in normalize_text(pdf_title_region) or title_score >= 0.88
         title_page_match = page_has_text(page, expected_title)
-        title_status = title_status_from_score(
-            title_score,
-            title_page_match,
-            ok_threshold=title_ok_threshold,
-            check_threshold=title_check_threshold,
-        )
 
         qr_url = qr.url if qr else ""
         link_url = link.url if link else ""
-        qr_status, qr_note, qr_detail_diff = compare_urls(expected_url, qr_url)
-        link_status, link_note, link_detail_diff = compare_urls(expected_url, link_url)
+        qr_status, qr_note = compare_urls(expected_url, qr_url)
+        link_status, link_note = compare_urls(expected_url, link_url)
+        qr_link_status, qr_link_note = compare_two_actual_urls(qr_url, link_url)
 
-        if qr_url and link_url:
-            qr_link_status, qr_link_note, qr_link_detail_diff = compare_urls(qr_url, link_url)
-        elif qr_url or link_url:
-            qr_link_status, qr_link_note, qr_link_detail_diff = "MISSING", "QR 또는 하이퍼링크 중 하나가 없음", False
-        else:
-            qr_link_status, qr_link_note, qr_link_detail_diff = "MISSING", "QR과 하이퍼링크 모두 없음", False
-
-        youtube_title = ""
-        youtube_csv_score = 0.0
-        youtube_pdf_score = 0.0
-        youtube_status = "SKIPPED"
-        youtube_note = ""
-        if youtube_title_check:
-            lookup_url = choose_title_lookup_url(expected_url, qr_url, link_url)
-            youtube_title, fetch_note = fetch_youtube_title_cached(lookup_url) if lookup_url else ("", "조회할 영상 URL 없음")
-            youtube_status, youtube_csv_score, youtube_pdf_score, youtube_note = youtube_title_status(
-                expected_title,
-                pdf_title_region,
-                youtube_title,
-                fetch_note,
-                ok_threshold=youtube_title_ok_threshold,
-                check_threshold=youtube_title_check_threshold,
-            )
-
+        title_status = "OK" if title_region_match else ("PAGE_ONLY" if title_page_match else "MISMATCH")
         issues = []
         detail_notes = []
 
@@ -646,14 +560,18 @@ def validate_video_cards(
             issues.append("TITLE_MISMATCH")
         elif title_status == "PAGE_ONLY":
             issues.append("TITLE_CHECK")
-            detail_notes.append(f"제목 확인 필요: {title_source}, 유사도 {title_score:.2f}")
+            detail_notes.append("제목은 페이지 전체에는 있으나 카드 영역에서 정확히 잡히지 않음")
+
+        detail_issue_map = {
+            "QR": (qr_status, qr_note),
+            "LINK": (link_status, link_note),
+            "QR_LINK": (qr_link_status, qr_link_note),
+        }
 
         if qr_status == "MISSING":
             issues.append("MISSING_QR")
         elif qr_status == "MISMATCH":
             issues.append("QR_MISMATCH")
-        elif qr_detail_diff and not semantic_match_ok:
-            issues.append("QR_URL_DETAIL_DIFF")
         elif qr_status != "EXACT":
             detail_notes.append(f"QR: {qr_note}")
 
@@ -661,62 +579,107 @@ def validate_video_cards(
             issues.append("MISSING_LINK")
         elif link_status == "MISMATCH":
             issues.append("LINK_MISMATCH")
-        elif link_detail_diff and not semantic_match_ok:
-            issues.append("LINK_URL_DETAIL_DIFF")
         elif link_status != "EXACT":
             detail_notes.append(f"LINK: {link_note}")
 
-        if qr_link_status == "MISMATCH":
-            issues.append("QR_LINK_MISMATCH")
-        elif qr_link_detail_diff and not semantic_match_ok:
-            issues.append("QR_LINK_MISMATCH")
+        if qr_link_status in {"MISMATCH", "MISSING_QR", "MISSING_LINK"}:
+            if qr_url or link_url:
+                issues.append("QR_LINK_MISMATCH")
         elif qr_link_status not in {"EXACT", "MISSING"}:
-            detail_notes.append(f"QR-LINK: {qr_link_note}")
+            detail_notes.append(f"QR↔LINK: {qr_link_note}")
 
-        if youtube_title_check:
-            if youtube_status == "MISMATCH":
-                issues.append("YOUTUBE_TITLE_MISMATCH")
-            elif youtube_status == "CHECK":
-                issues.append("YOUTUBE_TITLE_CHECK")
-            elif youtube_status == "FETCH_FAIL":
-                issues.append("YOUTUBE_TITLE_FETCH_FAIL")
-            if youtube_status != "OK":
-                detail_notes.append(f"YouTube 제목: {youtube_note}")
+        yt_title = ""
+        yt_title_url = link_url or qr_url or expected_url
+        yt_fetch_note = ""
+        yt_status = "SKIP"
+        yt_csv_score = 0.0
+        yt_pdf_score = 0.0
+        yt_note = ""
+        if check_youtube_titles:
+            yt_title, yt_fetch_note = fetch_youtube_title_cached(yt_title_url)
+            if yt_fetch_note and not yt_title:
+                parts = parse_url_parts(yt_title_url)
+                if parts.get("type") == "video":
+                    issues.append("YOUTUBE_TITLE_FETCH_FAIL")
+                yt_status = "SKIP"
+                yt_note = yt_fetch_note
+            else:
+                yt_status, yt_csv_score, yt_pdf_score, yt_note = judge_youtube_title(
+                    yt_title,
+                    expected_title,
+                    pdf_title_region,
+                    youtube_ok_threshold,
+                    youtube_check_threshold,
+                )
+                if yt_status == "MISMATCH":
+                    issues.append("YOUTUBE_TITLE_MISMATCH")
+                elif yt_status == "CHECK":
+                    issues.append("YOUTUBE_TITLE_CHECK")
+                if yt_note:
+                    detail_notes.append(f"YOUTUBE: {yt_note}")
 
-        if any(i in {"TITLE_MISMATCH", "YOUTUBE_TITLE_MISMATCH", "MISSING_QR", "QR_MISMATCH", "MISSING_LINK", "LINK_MISMATCH", "QR_LINK_MISMATCH"} for i in issues):
-            overall = "ISSUE"
-        elif issues:
-            overall = "CHECK"
+        if issues:
+            # Ambiguous title/details can be CHECK, actual mismatch/missing should be ISSUE.
+            check_only = {"TITLE_CHECK", "YOUTUBE_TITLE_CHECK"}
+            overall = "CHECK" if all(i in check_only for i in issues) else "ISSUE"
         else:
-            overall = "OK"
+            semantic_ok_values = {"EXACT", "VIDEO_ID_MATCH", "PLAYLIST_MATCH", "CHANNEL_MATCH"}
+            if semantic_match_ok:
+                overall = "OK" if qr_status in semantic_ok_values and link_status in semantic_ok_values else "CHECK"
+            else:
+                overall = "OK" if qr_status == "EXACT" and link_status == "EXACT" and qr_link_status == "EXACT" else "CHECK"
+
+        if overall == "OK" and detail_notes:
+            # Keep OK, but note details such as index differences.
+            pass
+
+        link_summary = summarize_link_result(qr_status, link_status, qr_link_status)
+        yt_display = "-"
+        if check_youtube_titles:
+            if yt_status == "OK":
+                yt_display = "유사"
+            elif yt_status == "CHECK":
+                yt_display = "확인"
+            elif yt_status == "MISMATCH":
+                yt_display = "불일치"
+            else:
+                yt_display = "조회불가/생략"
+
+        issue_text = ", ".join(dict.fromkeys(issues)) if issues else ""
+        note_text = " / ".join(detail_notes)
+        action_text = action_memo(issues, detail_notes)
 
         results.append(
             {
                 "상태": overall,
-                "문제유형": ", ".join(issues) if issues else "",
+                "문제유형": issue_text,
                 "페이지": page_num,
                 "카드번호": card_no,
+                "제목": expected_title,
                 "CSV 제목": expected_title,
-                "PDF 카드영역 텍스트": pdf_title_region,
-                "제목유사도": round(float(title_score), 3),
+                "PDF 제목": pdf_title_region,
                 "제목검수": title_status,
-                "유튜브 실제 제목": youtube_title,
-                "CSV-유튜브 제목유사도": round(float(youtube_csv_score), 3),
-                "PDF-유튜브 제목유사도": round(float(youtube_pdf_score), 3),
-                "유튜브제목검수": youtube_status,
+                "제목유사도": title_score,
+                "링크검수": link_summary,
                 "CSV URL": expected_url,
                 "QR URL": qr_url,
                 "QR검수": qr_status,
                 "하이퍼링크 URL": link_url,
                 "하이퍼링크검수": link_status,
                 "QR-하이퍼링크검수": qr_link_status,
-                "비고": " / ".join(detail_notes),
+                "유튜브 제목 검수": yt_display,
+                "유튜브 실제 제목": yt_title,
+                "유튜브 제목 조회 URL": yt_title_url if check_youtube_titles else "",
+                "유튜브-CSV 유사도": yt_csv_score,
+                "유튜브-PDF 유사도": yt_pdf_score,
+                "비고": note_text,
+                "조치 메모": action_text,
             }
         )
 
     extra_rows = []
     for qr in qrs:
-        key = item_key(qr)
+        key = (qr.page, round(qr.x0, 2), round(qr.y0, 2), qr.url)
         if key not in matched_qr_keys:
             extra_rows.append(
                 {
@@ -730,7 +693,7 @@ def validate_video_cards(
             )
 
     for link in links:
-        key = item_key(link)
+        key = (link.page, round(link.x0, 2), round(link.y0, 2), link.url)
         if key not in matched_link_keys:
             if link.kind == "internal":
                 kind = "INTERNAL_LINK"
@@ -754,63 +717,69 @@ def validate_video_cards(
     return pd.DataFrame(results), pd.DataFrame(extra_rows)
 
 
-def filter_video_df(video_df: pd.DataFrame, mode: str, keyword: str) -> pd.DataFrame:
-    df = video_df.copy()
-    if mode == "문제/확인 필요만":
-        df = df[df["상태"].isin(["CHECK", "ISSUE"])]
-    elif mode == "ISSUE만":
-        df = df[df["상태"] == "ISSUE"]
-    elif mode == "CHECK만":
-        df = df[df["상태"] == "CHECK"]
-    elif mode == "OK만":
-        df = df[df["상태"] == "OK"]
-    elif mode == "제목 문제":
-        df = df[df["문제유형"].str.contains("TITLE", na=False)]
-    elif mode == "QR 문제":
-        df = df[df["문제유형"].str.contains("QR|MISSING_QR", na=False)]
-    elif mode == "하이퍼링크 문제":
-        df = df[df["문제유형"].str.contains("LINK|MISSING_LINK", na=False)]
-    elif mode == "유튜브 제목 문제":
-        df = df[df["문제유형"].str.contains("YOUTUBE_TITLE", na=False)]
-
-    if keyword.strip():
-        pattern = re.escape(keyword.strip())
-        mask = pd.Series(False, index=df.index)
-        for col in ["CSV 제목", "PDF 카드영역 텍스트", "유튜브 실제 제목", "CSV URL", "QR URL", "하이퍼링크 URL", "문제유형", "비고"]:
-            if col in df.columns:
-                mask = mask | df[col].astype(str).str.contains(pattern, case=False, na=False)
-        df = df[mask]
-    return df
+# -----------------------------
+# Display helpers
+# -----------------------------
+def compact_view(video_df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "상태", "페이지", "카드번호", "제목", "PDF 제목", "제목검수", "링크검수", "유튜브 제목 검수", "문제유형", "조치 메모",
+    ]
+    out = video_df[[c for c in cols if c in video_df.columns]].copy()
+    out["카드"] = out.pop("카드번호") if "카드번호" in out.columns else ""
+    ordered = ["상태", "페이지", "카드", "제목", "PDF 제목", "제목검수", "링크검수", "유튜브 제목 검수", "문제유형", "조치 메모"]
+    return out[[c for c in ordered if c in out.columns]]
 
 
-def issue_type_counts(video_df: pd.DataFrame) -> pd.DataFrame:
-    counts = {key: 0 for key in ISSUE_ORDER}
-    for value in video_df.get("문제유형", pd.Series(dtype=str)).fillna(""):
-        for part in [p.strip() for p in str(value).split(",") if p.strip()]:
-            counts[part] = counts.get(part, 0) + 1
-    rows = [{"문제유형": k, "개수": v} for k, v in counts.items() if v > 0]
-    return pd.DataFrame(rows)
+def filter_df(df: pd.DataFrame, status_filter: List[str], issue_filter: List[str], search_text: str, problem_only: bool) -> pd.DataFrame:
+    out = df.copy()
+    if problem_only:
+        out = out[out["상태"].isin(["CHECK", "ISSUE"])]
+    if status_filter:
+        out = out[out["상태"].isin(status_filter)]
+    if issue_filter:
+        pattern = "|".join(re.escape(x) for x in issue_filter)
+        out = out[out["문제유형"].fillna("").str.contains(pattern, case=False, regex=True)]
+    if search_text.strip():
+        search = search_text.strip().lower()
+        searchable = out.fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        out = out[searchable.str.contains(re.escape(search), regex=True)]
+    return out
 
 
-def render_page_preview(pdf_bytes: bytes, page_num: int, qrs: List[PdfQr], links: List[PdfLink], draw_boxes: bool = True, zoom: float = 1.25) -> Image.Image:
-    doc = load_pdf(pdf_bytes)
+def status_help_text(video_df: pd.DataFrame) -> str:
+    issue_count = int((video_df["상태"] == "ISSUE").sum())
+    check_count = int((video_df["상태"] == "CHECK").sum())
+    if issue_count:
+        return f"수정이 필요한 ISSUE가 {issue_count}개 있습니다. 먼저 문제 항목 탭에서 확인하세요."
+    if check_count:
+        return f"치명적 오류는 없고 CHECK가 {check_count}개 있습니다. URL 세부값/제목 유사도를 확인하면 됩니다."
+    return "모든 영상 카드가 OK입니다."
+
+
+def render_page_preview(doc: fitz.Document, page_num: int, qrs: List[PdfQr], links: List[PdfLink], zoom: float = 1.0) -> Image.Image:
     page = doc[page_num - 1]
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    matrix = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    if draw_boxes:
-        draw = ImageDraw.Draw(img)
-        for qr in [q for q in qrs if q.page == page_num]:
-            box = [qr.x0 * zoom, qr.y0 * zoom, qr.x1 * zoom, qr.y1 * zoom]
-            draw.rectangle(box, outline=(20, 140, 70), width=4)
-            draw.text((box[0], max(0, box[1] - 18)), "QR", fill=(20, 140, 70))
-        for link in [l for l in links if l.page == page_num]:
-            box = [link.x0 * zoom, link.y0 * zoom, link.x1 * zoom, link.y1 * zoom]
-            color = (220, 120, 20) if link.kind == "external" else (80, 80, 80)
-            draw.rectangle(box, outline=color, width=3)
-            draw.text((box[0], max(0, box[1] - 18)), "LINK", fill=color)
+    draw = ImageDraw.Draw(img)
+
+    # QR: red boxes, Links: blue boxes. RGB values are only for generated preview annotation.
+    for qr in [q for q in qrs if q.page == page_num]:
+        rect = [qr.x0 * zoom, qr.y0 * zoom, qr.x1 * zoom, qr.y1 * zoom]
+        draw.rectangle(rect, outline=(220, 40, 40), width=4)
+        draw.text((rect[0], max(0, rect[1] - 18)), "QR", fill=(220, 40, 40))
+
+    for link in [l for l in links if l.page == page_num]:
+        rect = [link.x0 * zoom, link.y0 * zoom, link.x1 * zoom, link.y1 * zoom]
+        color = (30, 100, 220) if link.kind == "external" else (120, 120, 120)
+        draw.rectangle(rect, outline=color, width=3)
+        draw.text((rect[0], max(0, rect[1] - 18)), "LINK" if link.kind == "external" else "INTERNAL", fill=color)
     return img
 
 
+# -----------------------------
+# Excel report
+# -----------------------------
 def autosize_sheet(ws):
     for col in ws.columns:
         max_len = 0
@@ -818,23 +787,13 @@ def autosize_sheet(ws):
         for cell in col:
             value = "" if cell.value is None else str(cell.value)
             max_len = max(max_len, min(len(value), 70))
-        ws.column_dimensions[col_letter].width = max(min(max_len + 2, 60), 10)
+        ws.column_dimensions[col_letter].width = max(max_len + 2, 10)
 
 
 def write_dataframe(ws, df: pd.DataFrame):
     header_fill = PatternFill("solid", fgColor="D9EAF7")
     thin = Side(style="thin", color="DDDDDD")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    if df.empty:
-        for c_idx, col in enumerate(df.columns, start=1):
-            cell = ws.cell(row=1, column=c_idx, value=col)
-            cell.font = Font(bold=True, color="1F2A44")
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = border
-        autosize_sheet(ws)
-        return
 
     for c_idx, col in enumerate(df.columns, start=1):
         cell = ws.cell(row=1, column=c_idx, value=col)
@@ -852,14 +811,10 @@ def write_dataframe(ws, df: pd.DataFrame):
         "INTERNAL_LINK": "E7E6E6",
     }
 
-    status_col = df.columns[0] if len(df.columns) else None
-    for r_idx, (_, row) in enumerate(df.iterrows(), start=2):
-        status_value = str(row.get(status_col, "")) if status_col else ""
+    for r_idx, row in enumerate(df.itertuples(index=False, name=None), start=2):
+        status_value = str(row[0]) if row else ""
         row_fill = PatternFill("solid", fgColor=status_colors.get(status_value, "FFFFFF"))
-        for c_idx, col in enumerate(df.columns, start=1):
-            value = row[col]
-            if pd.isna(value):
-                value = ""
+        for c_idx, value in enumerate(row, start=1):
             cell = ws.cell(row=r_idx, column=c_idx, value=value)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             cell.border = border
@@ -869,27 +824,6 @@ def write_dataframe(ws, df: pd.DataFrame):
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    autosize_sheet(ws)
-
-
-def style_summary(ws):
-    header_fill = PatternFill("solid", fgColor="1F2A44")
-    title_fill = PatternFill("solid", fgColor="D9EAF7")
-    thin = Side(style="thin", color="DDDDDD")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.border = border
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    for row_idx in [8, 9]:
-        if ws.cell(row=row_idx, column=1).value:
-            ws.cell(row=row_idx, column=1).fill = title_fill
-            ws.cell(row=row_idx, column=1).font = Font(bold=True)
     autosize_sheet(ws)
 
 
@@ -903,50 +837,31 @@ def build_excel_report(video_df: pd.DataFrame, extra_df: pd.DataFrame) -> bytes:
     check = int((video_df["상태"] == "CHECK").sum()) if total else 0
     issue = int((video_df["상태"] == "ISSUE").sum()) if total else 0
     extra_count = len(extra_df)
-    qr_count = int(video_df["QR URL"].astype(str).str.len().gt(0).sum()) if total else 0
-    link_count = int(video_df["하이퍼링크 URL"].astype(str).str.len().gt(0).sum()) if total else 0
 
     summary_rows = [
-        ["항목", "개수", "비고"],
-        ["CSV 기준 영상 카드", total, "CSV의 페이지/카드번호 기준"],
-        ["OK", ok, "바로 통과 가능"],
-        ["CHECK", check, "확인 권장"],
-        ["ISSUE", issue, "수정 필요 가능성 높음"],
-        ["인식된 영상 카드 QR", qr_count, "CSV 기준 카드에 매칭된 QR"],
-        ["인식된 영상 카드 하이퍼링크", link_count, "CSV 기준 카드에 매칭된 외부 링크"],
-        ["기타 QR/링크", extra_count, "CSV 영상 카드에 매칭되지 않은 QR/링크"],
-        ["", "", ""],
-        ["문제유형", "개수", "설명"],
+        ["항목", "개수"],
+        ["CSV 기준 영상 카드", total],
+        ["OK", ok],
+        ["CHECK", check],
+        ["ISSUE", issue],
+        ["기타 QR/링크", extra_count],
     ]
-    descriptions = {
-        "TITLE_MISMATCH": "PDF 카드 제목과 CSV 제목이 다름",
-        "TITLE_CHECK": "제목이 페이지에는 있으나 카드 영역 정확도 확인 필요",
-        "YOUTUBE_TITLE_MISMATCH": "연결된 유튜브 실제 제목과 CSV/PDF 제목 차이 큼",
-        "YOUTUBE_TITLE_CHECK": "연결된 유튜브 실제 제목과 CSV/PDF 제목 유사도 확인 권장",
-        "YOUTUBE_TITLE_FETCH_FAIL": "유튜브 실제 제목을 가져오지 못함",
-        "MISSING_QR": "QR을 찾지 못함",
-        "QR_MISMATCH": "QR URL이 CSV URL과 다름",
-        "QR_URL_DETAIL_DIFF": "영상/플레이리스트 ID는 같지만 URL 세부값이 다름",
-        "MISSING_LINK": "하이퍼링크를 찾지 못함",
-        "LINK_MISMATCH": "하이퍼링크 URL이 CSV URL과 다름",
-        "LINK_URL_DETAIL_DIFF": "영상/플레이리스트 ID는 같지만 URL 세부값이 다름",
-        "QR_LINK_MISMATCH": "QR URL과 카드 하이퍼링크 URL이 서로 다름",
-    }
-    counts_df = issue_type_counts(video_df)
     for row in summary_rows:
         ws_summary.append(row)
-    for _, row in counts_df.iterrows():
-        ws_summary.append([row["문제유형"], int(row["개수"]), descriptions.get(row["문제유형"], "")])
-    style_summary(ws_summary)
+    for cell in ws_summary[1]:
+        cell.font = Font(bold=True, color="1F2A44")
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+    autosize_sheet(ws_summary)
 
-    ws_video = wb.create_sheet("영상카드_검수")
+    ws_compact = wb.create_sheet("보기용_요약")
+    write_dataframe(ws_compact, compact_view(video_df))
+
+    ws_problem = wb.create_sheet("문제항목만")
+    problem_df = video_df[video_df["상태"].isin(["CHECK", "ISSUE"])].copy()
+    write_dataframe(ws_problem, compact_view(problem_df) if not problem_df.empty else pd.DataFrame(columns=compact_view(video_df).columns))
+
+    ws_video = wb.create_sheet("상세_전체데이터")
     write_dataframe(ws_video, video_df)
-
-    ws_issue = wb.create_sheet("문제항목만")
-    issue_only = video_df[video_df["상태"].isin(["CHECK", "ISSUE"])].copy()
-    if issue_only.empty:
-        issue_only = pd.DataFrame(columns=video_df.columns)
-    write_dataframe(ws_issue, issue_only)
 
     ws_extra = wb.create_sheet("기타_QR_링크")
     if extra_df.empty:
@@ -958,26 +873,29 @@ def build_excel_report(video_df: pd.DataFrame, extra_df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+# -----------------------------
+# Main UI
+# -----------------------------
 def main():
     st.set_page_config(page_title="PDF QR 링크 자동 검수기", page_icon="✅", layout="wide")
     st.title("PDF QR · 하이퍼링크 자동 검수기")
-    st.caption("CSV의 페이지/카드번호/제목/유튜브링크를 기준으로 PDF 안의 영상 제목, QR, 클릭 링크를 비교합니다.")
+    st.caption("CSV의 페이지/카드번호/제목/유튜브링크를 기준으로 PDF 안의 영상 제목, QR, 클릭 링크, 유튜브 실제 제목을 비교합니다.")
 
     with st.sidebar:
         st.header("검수 옵션")
         zoom = st.slider("QR 인식 해상도", min_value=1.0, max_value=4.0, value=2.0, step=0.5)
-        st.caption("QR 인식 실패가 있으면 2.5 또는 3.0으로 올려보세요. 값이 높을수록 느려질 수 있습니다.")
+        st.caption("QR 인식 실패가 있으면 2.5 또는 3.0으로 올려보세요.")
         title_y_min = st.number_input("제목 탐색 Y 시작", min_value=0, max_value=1080, value=520, step=5)
         title_y_max = st.number_input("제목 탐색 Y 끝", min_value=0, max_value=1080, value=600, step=5)
-        auto_title_search = st.checkbox("제목 위치 자동 보정", value=True)
-        st.caption("디자인이 조금 바뀌어도 카드 영역 안에서 CSV 제목과 가장 비슷한 텍스트를 찾습니다.")
+        auto_title_region = st.checkbox("제목 위치 자동 보정", value=True)
+        st.caption("카드 영역 안에서 CSV 제목과 가장 비슷한 텍스트를 찾습니다. 켜두는 것을 권장합니다.")
         semantic_match_ok = st.checkbox("영상 ID가 같으면 OK 처리", value=True)
-        st.caption("체크 해제 시 index/list 등 URL 세부값이 다르면 CHECK로 표시됩니다.")
-        youtube_title_check = st.checkbox("유튜브 실제 영상 제목까지 검수", value=True)
-        st.caption("QR/하이퍼링크의 영상 URL로 YouTube 실제 제목을 가져와 CSV/PDF 제목과 비교합니다. 인터넷 연결이 필요합니다.")
-        youtube_title_ok_threshold = st.slider("유튜브 제목 OK 기준", 0.50, 1.00, 0.82, 0.01)
-        youtube_title_check_threshold = st.slider("유튜브 제목 CHECK 기준", 0.30, 0.95, 0.62, 0.01)
-        show_preview_boxes = st.checkbox("미리보기에서 QR/링크 박스 표시", value=True)
+        st.caption("체크 해제 시 index 등 URL 세부값이 다르면 CHECK로 표시됩니다.")
+        st.divider()
+        check_youtube_titles = st.checkbox("유튜브 실제 영상 제목까지 검수", value=False)
+        youtube_ok_threshold = st.slider("유튜브 제목 OK 기준", 0.50, 1.00, 0.82, 0.01)
+        youtube_check_threshold = st.slider("유튜브 제목 CHECK 기준", 0.30, 0.95, 0.62, 0.01)
+        st.caption("유튜브 제목과 CSV/PDF 제목의 유사도 기준입니다. 기본값 권장.")
 
     pdf_file = st.file_uploader("PDF 파일 업로드", type=["pdf"])
     csv_file = st.file_uploader("CSV 기준 데이터 업로드", type=["csv"])
@@ -997,7 +915,7 @@ def main():
                 st.error(f"CSV 필수 컬럼이 없습니다: {missing}")
                 st.stop()
 
-            with st.spinner("PDF에서 QR, 하이퍼링크, 제목 정보를 검수하는 중..."):
+            with st.spinner("PDF에서 QR과 하이퍼링크를 추출하는 중..."):
                 doc = load_pdf(pdf_bytes)
                 expected_counts = (
                     csv_df.groupby("페이지")["카드번호"].max().dropna().astype(int).to_dict()
@@ -1006,6 +924,16 @@ def main():
                 )
                 qrs = extract_qrs(doc, zoom=zoom, expected_counts=expected_counts)
                 links = extract_links(doc)
+
+            if check_youtube_titles:
+                st.info("유튜브 실제 제목을 조회합니다. 영상 개수에 따라 시간이 조금 걸릴 수 있어요.")
+                progress = st.progress(0)
+                # validate_video_cards will fetch titles; progress is approximate.
+                progress.progress(10)
+            else:
+                progress = None
+
+            with st.spinner("CSV 기준으로 제목 / QR / 하이퍼링크 / 유튜브 제목을 비교하는 중..."):
                 video_df, extra_df = validate_video_cards(
                     doc=doc,
                     csv_df=csv_df,
@@ -1014,80 +942,125 @@ def main():
                     title_y_min=float(title_y_min),
                     title_y_max=float(title_y_max),
                     semantic_match_ok=semantic_match_ok,
-                    auto_title_search=auto_title_search,
-                    youtube_title_check=youtube_title_check,
-                    youtube_title_ok_threshold=float(youtube_title_ok_threshold),
-                    youtube_title_check_threshold=float(youtube_title_check_threshold),
+                    auto_title_region=auto_title_region,
+                    check_youtube_titles=check_youtube_titles,
+                    youtube_ok_threshold=float(youtube_ok_threshold),
+                    youtube_check_threshold=float(youtube_check_threshold),
                 )
+                if progress is not None:
+                    progress.progress(100)
+                    time.sleep(0.2)
+                    progress.empty()
 
-            st.session_state["result_video_df"] = video_df
-            st.session_state["result_extra_df"] = extra_df
-            st.session_state["result_pdf_bytes"] = pdf_bytes
-            st.session_state["result_qrs"] = qrs
-            st.session_state["result_links"] = links
+            st.session_state["result"] = {
+                "video_df": video_df,
+                "extra_df": extra_df,
+                "pdf_bytes": pdf_bytes,
+                "qrs": qrs,
+                "links": links,
+                "page_count": doc.page_count,
+            }
             st.success("검수가 완료되었습니다.")
-
         except Exception as exc:
             st.exception(exc)
+            return
 
-    if "result_video_df" not in st.session_state:
+    result = st.session_state.get("result")
+    if not result:
         return
 
-    video_df = st.session_state["result_video_df"]
-    extra_df = st.session_state["result_extra_df"]
-    pdf_bytes = st.session_state["result_pdf_bytes"]
-    qrs = st.session_state["result_qrs"]
-    links = st.session_state["result_links"]
-
+    video_df = result["video_df"]
+    extra_df = result["extra_df"]
     ok = int((video_df["상태"] == "OK").sum())
     check = int((video_df["상태"] == "CHECK").sum())
     issue = int((video_df["상태"] == "ISSUE").sum())
 
+    st.subheader("검수 요약")
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("CSV 영상 카드", len(video_df))
     col2.metric("OK", ok)
     col3.metric("CHECK", check)
     col4.metric("ISSUE", issue)
     col5.metric("기타 QR/링크", len(extra_df))
+    st.info(status_help_text(video_df))
 
-    counts_df = issue_type_counts(video_df)
-    if not counts_df.empty:
-        with st.expander("문제유형별 요약 보기", expanded=False):
-            st.dataframe(counts_df, use_container_width=True, hide_index=True)
+    issue_counts = (
+        video_df["문제유형"].fillna("").str.split(", ").explode().replace("", np.nan).dropna().value_counts()
+    )
+    if not issue_counts.empty:
+        with st.expander("문제유형별 개수 보기", expanded=False):
+            st.dataframe(issue_counts.rename_axis("문제유형").reset_index(name="개수"), hide_index=True, use_container_width=True)
 
-    tab1, tab2, tab3 = st.tabs(["영상 카드 검수", "기타 QR/하이퍼링크", "페이지 미리보기"])
+    st.subheader("결과 보기")
+    filter_cols = st.columns([1.2, 1.5, 1.5, 3])
+    with filter_cols[0]:
+        problem_only = st.checkbox("문제 항목만 보기", value=True)
+    with filter_cols[1]:
+        status_filter = st.multiselect("상태", options=["OK", "CHECK", "ISSUE"], default=[])
+    with filter_cols[2]:
+        all_issues = sorted({x for cell in video_df["문제유형"].fillna("") for x in cell.split(", ") if x})
+        issue_filter = st.multiselect("문제유형", options=all_issues, default=[])
+    with filter_cols[3]:
+        search_text = st.text_input("검색", placeholder="제목, URL, 문제유형, 메모 검색")
+
+    filtered = filter_df(video_df, status_filter, issue_filter, search_text, problem_only)
+    compact_df = compact_view(filtered)
+
+    tab1, tab2, tab3, tab4 = st.tabs(["보기용 요약", "상세 원자료", "기타 QR/링크", "페이지 미리보기"])
+
     with tab1:
-        fcol1, fcol2 = st.columns([1, 2])
-        with fcol1:
-            filter_mode = st.selectbox(
-                "표시 필터",
-                ["전체", "문제/확인 필요만", "ISSUE만", "CHECK만", "OK만", "제목 문제", "유튜브 제목 문제", "QR 문제", "하이퍼링크 문제"],
+        st.caption("URL은 숨기고 판단에 필요한 항목만 보여줍니다. 상세 URL은 '상세 원자료' 탭에서 확인하세요.")
+        st.dataframe(
+            compact_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "상태": st.column_config.TextColumn("상태", width="small"),
+                "페이지": st.column_config.NumberColumn("페이지", width="small"),
+                "카드": st.column_config.NumberColumn("카드", width="small"),
+                "제목": st.column_config.TextColumn("CSV 제목", width="medium"),
+                "PDF 제목": st.column_config.TextColumn("PDF 제목", width="medium"),
+                "조치 메모": st.column_config.TextColumn("조치 메모", width="large"),
+            },
+        )
+
+        if not filtered.empty:
+            st.markdown("#### 선택 항목 상세 확인")
+            options = [f"p{int(r['페이지'])}-card{int(r['카드번호'])} | {r['제목']}" for _, r in filtered.iterrows()]
+            selected = st.selectbox("상세를 볼 항목", options=options)
+            sel_idx = options.index(selected)
+            row = filtered.iloc[sel_idx]
+            detail_cols = st.columns(3)
+            detail_cols[0].markdown(f"**CSV 제목**  \n{row.get('CSV 제목','')}")
+            detail_cols[1].markdown(f"**PDF 제목**  \n{row.get('PDF 제목','')}")
+            detail_cols[2].markdown(f"**유튜브 실제 제목**  \n{row.get('유튜브 실제 제목','') or '-'}")
+            st.markdown("**링크 상세**")
+            st.code(
+                f"CSV URL:\n{row.get('CSV URL','')}\n\nQR URL:\n{row.get('QR URL','')}\n\n하이퍼링크 URL:\n{row.get('하이퍼링크 URL','')}",
+                language="text",
             )
-        with fcol2:
-            keyword = st.text_input("검색", placeholder="제목, URL, 문제유형 등")
-        filtered_df = filter_video_df(video_df, filter_mode, keyword)
-        st.caption(f"표시 중: {len(filtered_df)}건 / 전체 {len(video_df)}건")
-        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+            st.markdown(f"**조치 메모:** {row.get('조치 메모','')}")
 
     with tab2:
-        if extra_df.empty:
-            st.info("CSV 영상 카드 기준에 매칭되지 않은 기타 QR/하이퍼링크가 없습니다.")
-        else:
-            extra_mode = st.selectbox("기타 항목 필터", ["전체", "EXTRA_QR", "EXTRA_LINK", "INTERNAL_LINK"])
-            display_extra = extra_df if extra_mode == "전체" else extra_df[extra_df["구분"] == extra_mode]
-            st.dataframe(display_extra, use_container_width=True, hide_index=True)
+        st.caption("검수 원자료 전체입니다. URL 전체 비교가 필요할 때 사용하세요.")
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
 
     with tab3:
-        issue_pages = sorted(video_df.loc[video_df["상태"].isin(["CHECK", "ISSUE"]), "페이지"].dropna().astype(int).unique().tolist())
-        all_pages = list(range(1, len(load_pdf(pdf_bytes)) + 1))
-        page_options = issue_pages if issue_pages else all_pages
-        pcol1, pcol2 = st.columns([1, 4])
-        with pcol1:
-            selected_page = st.selectbox("미리보기 페이지", page_options)
-            st.caption("초록: QR / 주황: 외부 링크 / 회색: 내부 링크")
-        with pcol2:
-            preview_img = render_page_preview(pdf_bytes, int(selected_page), qrs, links, draw_boxes=show_preview_boxes, zoom=1.25)
-            st.image(preview_img, use_container_width=True)
+        st.caption("CSV 영상 카드 기준에 매칭되지 않은 QR, 외부 링크, PDF 내부 이동 링크입니다.")
+        st.dataframe(extra_df, use_container_width=True, hide_index=True)
+
+    with tab4:
+        st.caption("빨간 박스는 QR, 파란 박스는 외부 하이퍼링크, 회색 박스는 내부 페이지 이동 링크입니다.")
+        page_options = list(range(1, int(result["page_count"]) + 1))
+        if not filtered.empty:
+            default_page = int(filtered.iloc[0]["페이지"])
+        else:
+            default_page = page_options[0]
+        page_num = st.selectbox("미리보기 페이지", options=page_options, index=page_options.index(default_page))
+        preview_zoom = st.slider("미리보기 확대", 0.5, 2.0, 1.0, 0.25)
+        doc = load_pdf(result["pdf_bytes"])
+        img = render_page_preview(doc, int(page_num), result["qrs"], result["links"], zoom=float(preview_zoom))
+        st.image(img, use_container_width=True)
 
     excel_bytes = build_excel_report(video_df, extra_df)
     st.download_button(
@@ -1096,8 +1069,6 @@ def main():
         file_name="pdf_qr_link_validation_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-    st.caption("업로드한 PDF/CSV는 앱 실행 중 메모리에서만 처리됩니다. 이 코드에서는 서버 디스크에 별도로 저장하지 않습니다.")
 
 
 if __name__ == "__main__":
