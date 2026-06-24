@@ -76,20 +76,14 @@ def normalize_title_for_similarity(value: str) -> str:
     value = "" if value is None else str(value)
     value = html.unescape(value)
     value = unicodedata.normalize("NFKC", value)
-    value = value.lower()
-    # YouTube title often includes channel/series labels. They should not dominate similarity.
-    noise_patterns = [
-        r"\bkia\s+global\s+how\s*to\b",
-        r"\bkia\s+how\s*to\b",
-        r"\bhow\s*to\b",
-        r"\bofficial\b",
-        r"\bvideo\b",
-        r"\bguide\b",
-        r"\bthe\s+kia\s+k4\b",
-    ]
-    for pat in noise_patterns:
-        value = re.sub(pat, " ", value, flags=re.IGNORECASE)
     value = value.replace("&amp;", "&")
+
+    # YouTube titles may be formatted as "Kia How To | <title>".
+    # Only this leading prefix is ignored. Everything after it remains part of the comparison.
+    # This is important because phrases like "How to use digital key 2" are actual item titles.
+    value = re.sub(r"^\s*kia\s+how\s*to\s*[|｜]\s*", "", value, flags=re.IGNORECASE)
+
+    value = value.lower()
     value = re.sub(r"[^a-z0-9가-힣]+", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
@@ -893,9 +887,19 @@ def main():
         st.caption("체크 해제 시 index 등 URL 세부값이 다르면 CHECK로 표시됩니다.")
         st.divider()
         check_youtube_titles = st.checkbox("유튜브 실제 영상 제목까지 검수", value=False)
-        youtube_ok_threshold = st.slider("유튜브 제목 OK 기준", 0.50, 1.00, 0.82, 0.01)
-        youtube_check_threshold = st.slider("유튜브 제목 CHECK 기준", 0.30, 0.95, 0.62, 0.01)
-        st.caption("유튜브 제목과 CSV/PDF 제목의 유사도 기준입니다. 기본값 권장.")
+        title_match_level = st.selectbox(
+            "유튜브 제목 검수 기준",
+            ["보통 (추천)", "엄격", "느슨"],
+            index=0,
+            help="유튜브 제목 앞의 'Kia How To |' 접두어만 제외하고, 나머지 문구는 모두 비교합니다.",
+        )
+        if title_match_level == "엄격":
+            youtube_ok_threshold, youtube_check_threshold = 0.90, 0.72
+        elif title_match_level == "느슨":
+            youtube_ok_threshold, youtube_check_threshold = 0.75, 0.55
+        else:
+            youtube_ok_threshold, youtube_check_threshold = 0.82, 0.62
+        st.caption("유튜브 제목 앞의 ‘Kia How To |’만 무시하고, 그 뒤 제목 전체는 CSV/PDF 제목과 비교합니다.")
 
     pdf_file = st.file_uploader("PDF 파일 업로드", type=["pdf"])
     csv_file = st.file_uploader("CSV 기준 데이터 업로드", type=["csv"])
