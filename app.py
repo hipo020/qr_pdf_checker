@@ -4,7 +4,7 @@ import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cv2
 import fitz  # PyMuPDF
@@ -17,6 +17,11 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 try:
+    import requests
+except Exception:
+    requests = None
+
+try:
     from pyzbar.pyzbar import decode as pyzbar_decode
 except Exception:
     pyzbar_decode = None
@@ -26,12 +31,16 @@ REQUIRED_COLUMNS = ["페이지", "카드번호", "제목", "유튜브링크"]
 ISSUE_ORDER = [
     "TITLE_MISMATCH",
     "TITLE_CHECK",
+    "YOUTUBE_TITLE_MISMATCH",
+    "YOUTUBE_TITLE_CHECK",
+    "YOUTUBE_TITLE_FETCH_FAIL",
     "MISSING_QR",
     "QR_MISMATCH",
     "QR_URL_DETAIL_DIFF",
     "MISSING_LINK",
     "LINK_MISMATCH",
     "LINK_URL_DETAIL_DIFF",
+    "QR_LINK_MISMATCH",
 ]
 
 
@@ -163,6 +172,109 @@ def is_external_video_url(url: str) -> bool:
         return False
     parts = parse_url_parts(url)
     return parts["type"] in {"video", "playlist", "channel"}
+
+
+def clean_youtube_title(value: str) -> str:
+    """유튜브 실제 제목 비교용으로 흔한 접두/구분자를 정리합니다."""
+    value = "" if value is None else str(value)
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    # 유튜브 제목에 자주 붙는 브랜드/시리즈 접두어를 비교에서 덜 민감하게 처리합니다.
+    patterns = [
+        r"^kia\s+global\s+how\s*to\s*[|:\-–—]\s*",
+        r"^kia\s+how\s*to\s*[|:\-–—]\s*",
+        r"^the\s+kia\s+k4\s*[|:\-–—]\s*",
+    ]
+    for pat in patterns:
+        value = re.sub(pat, "", value, flags=re.I)
+    return value.strip()
+
+
+def youtube_title_similarity(expected: str, actual: str) -> float:
+    """CSV/PDF 제목과 유튜브 실제 제목은 접두어가 붙을 수 있어 별도 기준으로 비교합니다."""
+    expected_clean = clean_youtube_title(expected)
+    actual_clean = clean_youtube_title(actual)
+    ne = normalize_text(expected_clean)
+    na = normalize_text(actual_clean)
+    if not ne or not na:
+        return 0.0
+    if len(ne) >= 8 and ne in na:
+        return 0.97
+    if len(na) >= 8 and na in ne:
+        return 0.92
+
+    seq = SequenceMatcher(None, ne, na).ratio()
+
+    def tokens(text: str) -> set:
+        text = unicodedata.normalize("NFKC", str(text).lower())
+        return {t for t in re.findall(r"[a-z0-9]+", text) if len(t) >= 2}
+
+    te = tokens(expected_clean)
+    ta = tokens(actual_clean)
+    if te and ta:
+        overlap = len(te & ta) / max(len(te), 1)
+        jaccard = len(te & ta) / max(len(te | ta), 1)
+        return max(seq, overlap * 0.95, jaccard)
+    return seq
+
+
+def canonical_youtube_title_url(url: str) -> str:
+    """oEmbed가 이해하기 쉬운 YouTube URL 형태로 정리합니다."""
+    parts = parse_url_parts(url)
+    if parts.get("video_id"):
+        return f"https://www.youtube.com/watch?v={parts['video_id']}"
+    if parts.get("playlist_id"):
+        return f"https://www.youtube.com/playlist?list={parts['playlist_id']}"
+    return normalize_url(url)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def fetch_youtube_title_cached(url: str) -> Tuple[str, str]:
+    """YouTube oEmbed로 실제 영상 제목을 가져옵니다. 실패 시 빈 제목과 사유를 반환합니다."""
+    if requests is None:
+        return "", "requests 라이브러리 없음"
+    target = canonical_youtube_title_url(url)
+    if not target:
+        return "", "URL 없음"
+    parts = parse_url_parts(target)
+    if parts.get("type") != "video":
+        return "", "영상 URL이 아니어서 제목 조회 생략"
+    try:
+        endpoint = "https://www.youtube.com/oembed"
+        params = {"url": target, "format": "json"}
+        resp = requests.get(endpoint, params=params, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            return "", f"YouTube 제목 조회 실패: HTTP {resp.status_code}"
+        data = resp.json()
+        title = str(data.get("title", "")).strip()
+        if not title:
+            return "", "YouTube 제목 없음"
+        return title, ""
+    except Exception as exc:
+        return "", f"YouTube 제목 조회 오류: {exc}"
+
+
+def choose_title_lookup_url(expected_url: str, qr_url: str, link_url: str) -> str:
+    """실제 제목 조회에 사용할 URL을 고릅니다. 하이퍼링크를 우선하되 없으면 QR, CSV 순으로 사용합니다."""
+    for value in [link_url, qr_url, expected_url]:
+        if parse_url_parts(value).get("video_id"):
+            return value
+    return ""
+
+
+def youtube_title_status(expected_title: str, pdf_title: str, youtube_title: str, fetch_note: str, ok_threshold: float, check_threshold: float) -> Tuple[str, float, float, str]:
+    if not youtube_title:
+        if fetch_note and "생략" in fetch_note:
+            return "SKIPPED", 0.0, 0.0, fetch_note
+        return "FETCH_FAIL", 0.0, 0.0, fetch_note or "유튜브 실제 제목을 가져오지 못함"
+    csv_score = youtube_title_similarity(expected_title, youtube_title)
+    pdf_score = youtube_title_similarity(pdf_title, youtube_title) if pdf_title else 0.0
+    best_score = max(csv_score, pdf_score)
+    if csv_score >= ok_threshold or best_score >= ok_threshold:
+        return "OK", csv_score, pdf_score, "유튜브 실제 제목 유사"
+    if csv_score >= check_threshold or best_score >= check_threshold:
+        return "CHECK", csv_score, pdf_score, "유튜브 실제 제목 확인 권장"
+    return "MISMATCH", csv_score, pdf_score, "유튜브 실제 제목과 CSV/PDF 제목 차이 큼"
 
 
 def load_pdf(pdf_bytes: bytes) -> fitz.Document:
@@ -412,6 +524,9 @@ def validate_video_cards(
     auto_title_search: bool = True,
     title_ok_threshold: float = 0.88,
     title_check_threshold: float = 0.68,
+    youtube_title_check: bool = False,
+    youtube_title_ok_threshold: float = 0.82,
+    youtube_title_check_threshold: float = 0.62,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = csv_df.copy()
     for col in REQUIRED_COLUMNS:
@@ -449,11 +564,16 @@ def validate_video_cards(
                     "PDF 카드영역 텍스트": "",
                     "제목유사도": 0,
                     "제목검수": "MISMATCH",
+                    "유튜브 실제 제목": "",
+                    "CSV-유튜브 제목유사도": 0,
+                    "PDF-유튜브 제목유사도": 0,
+                    "유튜브제목검수": "SKIPPED",
                     "CSV URL": expected_url,
                     "QR URL": "",
                     "QR검수": "MISSING",
                     "하이퍼링크 URL": "",
                     "하이퍼링크검수": "MISSING",
+                    "QR-하이퍼링크검수": "MISSING",
                     "비고": "CSV의 페이지 번호가 PDF 페이지 수를 벗어남",
                 }
             )
@@ -490,8 +610,34 @@ def validate_video_cards(
             check_threshold=title_check_threshold,
         )
 
-        qr_status, qr_note, qr_detail_diff = compare_urls(expected_url, qr.url if qr else "")
-        link_status, link_note, link_detail_diff = compare_urls(expected_url, link.url if link else "")
+        qr_url = qr.url if qr else ""
+        link_url = link.url if link else ""
+        qr_status, qr_note, qr_detail_diff = compare_urls(expected_url, qr_url)
+        link_status, link_note, link_detail_diff = compare_urls(expected_url, link_url)
+
+        if qr_url and link_url:
+            qr_link_status, qr_link_note, qr_link_detail_diff = compare_urls(qr_url, link_url)
+        elif qr_url or link_url:
+            qr_link_status, qr_link_note, qr_link_detail_diff = "MISSING", "QR 또는 하이퍼링크 중 하나가 없음", False
+        else:
+            qr_link_status, qr_link_note, qr_link_detail_diff = "MISSING", "QR과 하이퍼링크 모두 없음", False
+
+        youtube_title = ""
+        youtube_csv_score = 0.0
+        youtube_pdf_score = 0.0
+        youtube_status = "SKIPPED"
+        youtube_note = ""
+        if youtube_title_check:
+            lookup_url = choose_title_lookup_url(expected_url, qr_url, link_url)
+            youtube_title, fetch_note = fetch_youtube_title_cached(lookup_url) if lookup_url else ("", "조회할 영상 URL 없음")
+            youtube_status, youtube_csv_score, youtube_pdf_score, youtube_note = youtube_title_status(
+                expected_title,
+                pdf_title_region,
+                youtube_title,
+                fetch_note,
+                ok_threshold=youtube_title_ok_threshold,
+                check_threshold=youtube_title_check_threshold,
+            )
 
         issues = []
         detail_notes = []
@@ -520,7 +666,24 @@ def validate_video_cards(
         elif link_status != "EXACT":
             detail_notes.append(f"LINK: {link_note}")
 
-        if any(i in {"TITLE_MISMATCH", "MISSING_QR", "QR_MISMATCH", "MISSING_LINK", "LINK_MISMATCH"} for i in issues):
+        if qr_link_status == "MISMATCH":
+            issues.append("QR_LINK_MISMATCH")
+        elif qr_link_detail_diff and not semantic_match_ok:
+            issues.append("QR_LINK_MISMATCH")
+        elif qr_link_status not in {"EXACT", "MISSING"}:
+            detail_notes.append(f"QR-LINK: {qr_link_note}")
+
+        if youtube_title_check:
+            if youtube_status == "MISMATCH":
+                issues.append("YOUTUBE_TITLE_MISMATCH")
+            elif youtube_status == "CHECK":
+                issues.append("YOUTUBE_TITLE_CHECK")
+            elif youtube_status == "FETCH_FAIL":
+                issues.append("YOUTUBE_TITLE_FETCH_FAIL")
+            if youtube_status != "OK":
+                detail_notes.append(f"YouTube 제목: {youtube_note}")
+
+        if any(i in {"TITLE_MISMATCH", "YOUTUBE_TITLE_MISMATCH", "MISSING_QR", "QR_MISMATCH", "MISSING_LINK", "LINK_MISMATCH", "QR_LINK_MISMATCH"} for i in issues):
             overall = "ISSUE"
         elif issues:
             overall = "CHECK"
@@ -537,11 +700,16 @@ def validate_video_cards(
                 "PDF 카드영역 텍스트": pdf_title_region,
                 "제목유사도": round(float(title_score), 3),
                 "제목검수": title_status,
+                "유튜브 실제 제목": youtube_title,
+                "CSV-유튜브 제목유사도": round(float(youtube_csv_score), 3),
+                "PDF-유튜브 제목유사도": round(float(youtube_pdf_score), 3),
+                "유튜브제목검수": youtube_status,
                 "CSV URL": expected_url,
-                "QR URL": qr.url if qr else "",
+                "QR URL": qr_url,
                 "QR검수": qr_status,
-                "하이퍼링크 URL": link.url if link else "",
+                "하이퍼링크 URL": link_url,
                 "하이퍼링크검수": link_status,
+                "QR-하이퍼링크검수": qr_link_status,
                 "비고": " / ".join(detail_notes),
             }
         )
@@ -602,11 +770,13 @@ def filter_video_df(video_df: pd.DataFrame, mode: str, keyword: str) -> pd.DataF
         df = df[df["문제유형"].str.contains("QR|MISSING_QR", na=False)]
     elif mode == "하이퍼링크 문제":
         df = df[df["문제유형"].str.contains("LINK|MISSING_LINK", na=False)]
+    elif mode == "유튜브 제목 문제":
+        df = df[df["문제유형"].str.contains("YOUTUBE_TITLE", na=False)]
 
     if keyword.strip():
         pattern = re.escape(keyword.strip())
         mask = pd.Series(False, index=df.index)
-        for col in ["CSV 제목", "PDF 카드영역 텍스트", "CSV URL", "QR URL", "하이퍼링크 URL", "문제유형", "비고"]:
+        for col in ["CSV 제목", "PDF 카드영역 텍스트", "유튜브 실제 제목", "CSV URL", "QR URL", "하이퍼링크 URL", "문제유형", "비고"]:
             if col in df.columns:
                 mask = mask | df[col].astype(str).str.contains(pattern, case=False, na=False)
         df = df[mask]
@@ -751,12 +921,16 @@ def build_excel_report(video_df: pd.DataFrame, extra_df: pd.DataFrame) -> bytes:
     descriptions = {
         "TITLE_MISMATCH": "PDF 카드 제목과 CSV 제목이 다름",
         "TITLE_CHECK": "제목이 페이지에는 있으나 카드 영역 정확도 확인 필요",
+        "YOUTUBE_TITLE_MISMATCH": "연결된 유튜브 실제 제목과 CSV/PDF 제목 차이 큼",
+        "YOUTUBE_TITLE_CHECK": "연결된 유튜브 실제 제목과 CSV/PDF 제목 유사도 확인 권장",
+        "YOUTUBE_TITLE_FETCH_FAIL": "유튜브 실제 제목을 가져오지 못함",
         "MISSING_QR": "QR을 찾지 못함",
         "QR_MISMATCH": "QR URL이 CSV URL과 다름",
         "QR_URL_DETAIL_DIFF": "영상/플레이리스트 ID는 같지만 URL 세부값이 다름",
         "MISSING_LINK": "하이퍼링크를 찾지 못함",
         "LINK_MISMATCH": "하이퍼링크 URL이 CSV URL과 다름",
         "LINK_URL_DETAIL_DIFF": "영상/플레이리스트 ID는 같지만 URL 세부값이 다름",
+        "QR_LINK_MISMATCH": "QR URL과 카드 하이퍼링크 URL이 서로 다름",
     }
     counts_df = issue_type_counts(video_df)
     for row in summary_rows:
@@ -799,6 +973,10 @@ def main():
         st.caption("디자인이 조금 바뀌어도 카드 영역 안에서 CSV 제목과 가장 비슷한 텍스트를 찾습니다.")
         semantic_match_ok = st.checkbox("영상 ID가 같으면 OK 처리", value=True)
         st.caption("체크 해제 시 index/list 등 URL 세부값이 다르면 CHECK로 표시됩니다.")
+        youtube_title_check = st.checkbox("유튜브 실제 영상 제목까지 검수", value=True)
+        st.caption("QR/하이퍼링크의 영상 URL로 YouTube 실제 제목을 가져와 CSV/PDF 제목과 비교합니다. 인터넷 연결이 필요합니다.")
+        youtube_title_ok_threshold = st.slider("유튜브 제목 OK 기준", 0.50, 1.00, 0.82, 0.01)
+        youtube_title_check_threshold = st.slider("유튜브 제목 CHECK 기준", 0.30, 0.95, 0.62, 0.01)
         show_preview_boxes = st.checkbox("미리보기에서 QR/링크 박스 표시", value=True)
 
     pdf_file = st.file_uploader("PDF 파일 업로드", type=["pdf"])
@@ -819,7 +997,7 @@ def main():
                 st.error(f"CSV 필수 컬럼이 없습니다: {missing}")
                 st.stop()
 
-            with st.spinner("PDF에서 QR과 하이퍼링크를 추출하는 중..."):
+            with st.spinner("PDF에서 QR, 하이퍼링크, 제목 정보를 검수하는 중..."):
                 doc = load_pdf(pdf_bytes)
                 expected_counts = (
                     csv_df.groupby("페이지")["카드번호"].max().dropna().astype(int).to_dict()
@@ -837,6 +1015,9 @@ def main():
                     title_y_max=float(title_y_max),
                     semantic_match_ok=semantic_match_ok,
                     auto_title_search=auto_title_search,
+                    youtube_title_check=youtube_title_check,
+                    youtube_title_ok_threshold=float(youtube_title_ok_threshold),
+                    youtube_title_check_threshold=float(youtube_title_check_threshold),
                 )
 
             st.session_state["result_video_df"] = video_df
@@ -880,7 +1061,7 @@ def main():
         with fcol1:
             filter_mode = st.selectbox(
                 "표시 필터",
-                ["전체", "문제/확인 필요만", "ISSUE만", "CHECK만", "OK만", "제목 문제", "QR 문제", "하이퍼링크 문제"],
+                ["전체", "문제/확인 필요만", "ISSUE만", "CHECK만", "OK만", "제목 문제", "유튜브 제목 문제", "QR 문제", "하이퍼링크 문제"],
             )
         with fcol2:
             keyword = st.text_input("검색", placeholder="제목, URL, 문제유형 등")
